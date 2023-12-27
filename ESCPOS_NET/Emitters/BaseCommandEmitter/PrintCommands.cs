@@ -16,7 +16,7 @@ namespace ESCPOS_NET.Emitters
             return data.ToCharArray().Select(x => (byte)x).ToArray();
         }
 
-        public virtual byte[] PrintLine(string line)
+        public virtual byte[] PrintLine(string line = null)
         {
             if (line == null)
             {
