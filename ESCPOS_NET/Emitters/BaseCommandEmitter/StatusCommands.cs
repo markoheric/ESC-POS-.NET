@@ -1,4 +1,5 @@
 ﻿using ESCPOS_NET.Emitters.BaseCommandValues;
+using SixLabors.ImageSharp.Processing;
 
 namespace ESCPOS_NET.Emitters
 {
