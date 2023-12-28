@@ -4,6 +4,7 @@ namespace ESCPOS_NET
 {
     public class PrinterStatusEventArgs : EventArgs
     {
+        public bool Connection { get; set; }
         public bool? IsWaitingForOnlineRecovery { get; set; }
 
         public bool? IsPaperCurrentlyFeeding { get; set; }

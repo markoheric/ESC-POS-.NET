@@ -1,8 +1,12 @@
+using ESCPOS_NET.Emitters;
+using ESCPOS_NET.Emitters.BaseCommandValues;
 using ESCPOS_NET.Utilities;
 using Microsoft.Extensions.Logging;
+using SixLabors.ImageSharp.PixelFormats;
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Reflection;
@@ -25,6 +29,7 @@ namespace ESCPOS_NET
 
         private readonly int _maxBytesPerWrite = 15000; // max byte chunks to write at once.
 
+        protected byte[] StatusBytes { get; set; } = null;
         public PrinterStatusEventArgs Status { get; private set; } = new PrinterStatusEventArgs();
 
         public event EventHandler StatusChanged;
@@ -86,9 +91,16 @@ namespace ESCPOS_NET
         {
             _writeTaskRunning = true;
             List<byte> internalWriteBuffer = new List<byte>();
+
+            List<byte> pollCommand = new List<byte>() { Cmd.GS, ESCPOS_NET.Emitters.BaseCommandValues.Status.RequestStatus, StatusCommand.PaperStatus };
+            const long delay = 100;
+            const long pollInterval = 500 - delay + 1;
+
+            Stopwatch stopwatch = Stopwatch.StartNew();
+
             while (true)
             {
-                await Task.Delay(100);
+                await Task.Delay((int)delay);
 
                 try
                 {
@@ -97,6 +109,13 @@ namespace ESCPOS_NET
                     {
                         internalWriteBuffer.AddRange(nextBytes);
                         WriteToBinaryWriter(ref internalWriteBuffer);
+                        stopwatch.Restart();
+                    }
+                    else if (stopwatch.ElapsedMilliseconds >= pollInterval)
+                    {
+                        // poll
+                        WriteToBinaryWriter(pollCommand);
+                        stopwatch.Restart();
                     }
                 }
                 catch (IOException)
@@ -125,6 +144,11 @@ namespace ESCPOS_NET
         protected virtual async void ReadLongRunningAsync()
         {
             _readTaskRunning = true;
+            Stopwatch stopwatch = Stopwatch.StartNew();
+
+            const long maxNoDataInterval = 2000;
+            bool connection = true;
+
             while (true)
             {
                 await Task.Delay(100);
@@ -142,10 +166,24 @@ namespace ESCPOS_NET
                             ReadBuffer.Enqueue((byte)buffer[ix]);
                             DataAvailable();
                         }
+
+                        stopwatch.Restart();
+
+                        if (!connection)
+                        {
+                            connection = true;
+                            TryUpdatePrinterStatus(true, null);
+                        }
+
+                    }
+                    else if (connection && stopwatch.ElapsedMilliseconds >= maxNoDataInterval)
+                    {
+                        connection = false;
+                        TryUpdatePrinterStatus(false, null);
                     }
                 }
 
-                catch
+                catch (Exception ex)
                 {
                     // Swallow the exception
                     //Logging.Logger?.LogDebug("[{Function}]:[{PrinterName}] Swallowing generic read exception... sometimes happens with serial port printers.", $"{this}.{MethodBase.GetCurrentMethod().Name}", PrinterName);
@@ -200,6 +238,33 @@ namespace ESCPOS_NET
             }
         }
 
+        protected void WriteToBinaryWriter(IReadOnlyList<byte> bytes)
+        {
+            try
+            {
+                while (bytes.Count > 0)
+                {
+
+                    int count = Math.Min(_maxBytesPerWrite, bytes.Count);
+                    this.WriteBytesUnderlying(bytes.ToArray(), 0, count);
+
+                    BytesWrittenSinceLastFlush += count;
+                    if (BytesWrittenSinceLastFlush >= 200)
+                    {
+                        // Immediately trigger a flush before proceeding so the output buffer will not be delayed.
+                        Flush(null, null);
+                    }
+                }
+
+                Flush(null, null);
+            }
+            catch (IOException e)
+            {
+                // Network or serial connection failed, dont consume the buffer this time around
+                Logging.Logger?.LogDebug(e, "Device appears disconnected.  No more bytes will be written until it is reconnected.");
+            }
+        }
+
         protected virtual void Flush(object sender, ElapsedEventArgs e)
         {
             try
@@ -227,40 +292,89 @@ namespace ESCPOS_NET
                     }
                 }
 
-                TryUpdatePrinterStatus(bytes);
+                TryUpdatePrinterStatus(true, bytes);
 
                 // TODO: call other update handlers.
             }
         }
 
-        private void TryUpdatePrinterStatus(byte[] bytes)
+        private bool DidStatusChange(bool connected, byte[] newStatusBytes)
         {
-            var bytesToString = BitConverter.ToString(bytes);
+            if (this.Status == null)
+            {
+                return true;
+            }
+
+            if (this.Status.Connection != connected)
+            {
+                return true;
+            }
+
+            if (this.StatusBytes == null)
+            {
+                return true;
+            }
+
+            if (newStatusBytes == null)
+            {
+                return false;
+            }
+
+
+            for (int i = 0; i < this.StatusBytes.Length && i < newStatusBytes.Length; i++)
+            {
+                if (this.StatusBytes[i] != newStatusBytes[i])
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+
+        static readonly byte[] EmptyStatusBytes = new byte[4];
+        private void TryUpdatePrinterStatus(bool connection, byte[] statusBytes)
+        {
+            statusBytes = statusBytes ?? StatusBytes ?? EmptyStatusBytes;
+            var bytesToString = BitConverter.ToString(statusBytes);
 
             Logging.Logger?.LogDebug("[{Function}]:[{PrinterName}] TryUpdatePrinterStatus: Received flag values {bytesToString}", $"{this}.{MethodBase.GetCurrentMethod().Name}", PrinterName, bytesToString);
 
             // Check header bits 0, 1 and 7 are 0, and 4 is 1
-            if (bytes[0].IsBitNotSet(0) && bytes[0].IsBitNotSet(1) && bytes[0].IsBitSet(4) && bytes[0].IsBitNotSet(7))
+            if (statusBytes[0].IsBitNotSet(0) && statusBytes[0].IsBitNotSet(1) && statusBytes[0].IsBitSet(4) && statusBytes[0].IsBitNotSet(7))
             {
-                Status = new PrinterStatusEventArgs()
-                {
-                    // byte[0] == 20 cash drawer closed
-                    // byte[0] == 16 cash drawer open
-                    // Note some cash drawers do not close properly.
-                    IsCashDrawerOpen = bytes[0].IsBitNotSet(2),
-                    IsPrinterOnline = bytes[0].IsBitNotSet(3),
-                    IsCoverOpen = bytes[0].IsBitSet(5),
-                    IsPaperCurrentlyFeeding = bytes[0].IsBitSet(6),
-                    IsWaitingForOnlineRecovery = bytes[1].IsBitSet(0),
-                    IsPaperFeedButtonPushed = bytes[1].IsBitSet(1),
-                    DidRecoverableNonAutocutterErrorOccur = bytes[1].IsBitSet(2),
-                    DidAutocutterErrorOccur = bytes[1].IsBitSet(3),
-                    DidUnrecoverableErrorOccur = bytes[1].IsBitSet(5),
-                    DidRecoverableErrorOccur = bytes[1].IsBitSet(6),
-                    IsPaperLow = bytes[2].IsBitSet(0) && bytes[2].IsBitSet(1),
-                    IsPaperOut = bytes[2].IsBitSet(2) && bytes[2].IsBitSet(3),
-                };
+                // TODO reverse check, return early
             }
+            else if (DidStatusChange(connection, statusBytes))
+            {
+            }
+            else
+            { 
+                return;
+            }
+
+            this.StatusBytes = statusBytes;
+
+            Status = new PrinterStatusEventArgs()
+            {
+                // byte[0] == 20 cash drawer closed
+                // byte[0] == 16 cash drawer open
+                // Note some cash drawers do not close properly.
+                Connection = connection,
+                IsCashDrawerOpen = statusBytes[0].IsBitNotSet(2),
+                IsPrinterOnline = statusBytes[0].IsBitNotSet(3),
+                IsCoverOpen = statusBytes[0].IsBitSet(5),
+                IsPaperCurrentlyFeeding = statusBytes[0].IsBitSet(6),
+                IsWaitingForOnlineRecovery = statusBytes[1].IsBitSet(0),
+                IsPaperFeedButtonPushed = statusBytes[1].IsBitSet(1),
+                DidRecoverableNonAutocutterErrorOccur = statusBytes[1].IsBitSet(2),
+                DidAutocutterErrorOccur = statusBytes[1].IsBitSet(3),
+                DidUnrecoverableErrorOccur = statusBytes[1].IsBitSet(5),
+                DidRecoverableErrorOccur = statusBytes[1].IsBitSet(6),
+                IsPaperLow = statusBytes[2].IsBitSet(0) && statusBytes[2].IsBitSet(1),
+                IsPaperOut = statusBytes[2].IsBitSet(2) && statusBytes[2].IsBitSet(3),
+            };
 
             if (StatusChanged != null)
             {
